@@ -1,0 +1,296 @@
+name: Build Alpine OpenResty image
+
+on:
+  push:
+    branches: [develop, master]
+    tags: ['v*']
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'docker/**'
+      - '.version'
+      - '.github/workflows/build-alpine.yml'
+      - 'scripts/buildx-alpine-openresty'
+  pull_request:
+    branches: [develop, master]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'docker/**'
+      - '.version'
+      - '.github/workflows/build-alpine.yml'
+      - 'scripts/buildx-alpine-openresty'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override image version for master/tag builds (alpine-<version>). Defaults to .version'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Prepare
+        run: |
+          platform='${{ matrix.platform }}'
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+          echo "REGISTRY_IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date '+%Y-%m-%d %T %Z')" >> "$GITHUB_ENV"
+          echo "BUILD_COMMIT=$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # No later git push/fetch — avoid leaving credentials on disk.
+          persist-credentials: false
+
+      - name: Resolve app version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            APP_VERSION='${{ inputs.version }}'
+          else
+            APP_VERSION="$(tr -d '[:space:]' < .version)"
+          fi
+          APP_VERSION="${APP_VERSION#v}"
+          if [ -z "$APP_VERSION" ]; then
+            echo '::error::APP_VERSION is empty (set workflow_dispatch version or .version)'
+            exit 1
+          fi
+          echo "APP_VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Load version pins
+        run: |
+          set -a
+          # shellcheck disable=SC1091
+          . docker/alpine/versions.env
+          set +a
+          {
+            echo "ALPINE_VERSION=${ALPINE_VERSION}"
+            echo "OPENRESTY_VERSION=${OPENRESTY_VERSION}"
+            echo "GEOIP2_REF=${GEOIP2_REF}"
+            echo "USE_LTO=${USE_LTO}"
+            echo "JOBS=$(nproc)"
+            echo "CERTBOT_VERSION=${CERTBOT_VERSION:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            # develop / PRs: alpine-<shortsha>
+            type=sha,prefix=alpine-,format=short,enable=${{ github.ref == 'refs/heads/develop' || github.event_name == 'pull_request' }}
+            # master / release tags: alpine + alpine-<version>
+            type=raw,value=alpine,enable=${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=alpine-${{ env.APP_VERSION }},enable=${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        if: github.event_name != 'pull_request'
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.alpine-openresty
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            ALPINE_VERSION=${{ env.ALPINE_VERSION }}
+            OPENRESTY_VERSION=${{ env.OPENRESTY_VERSION }}
+            GEOIP2_REF=${{ env.GEOIP2_REF }}
+            USE_LTO=${{ env.USE_LTO }}
+            JOBS=${{ env.JOBS }}
+            CERTBOT_VERSION=${{ env.CERTBOT_VERSION }}
+            BUILD_VERSION=${{ env.APP_VERSION }}
+            BUILD_COMMIT=${{ env.BUILD_COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=alpine-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=alpine-${{ env.PLATFORM_PAIR }}
+
+      - name: Build (PR compile check)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.alpine-openresty
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            ALPINE_VERSION=${{ env.ALPINE_VERSION }}
+            OPENRESTY_VERSION=${{ env.OPENRESTY_VERSION }}
+            GEOIP2_REF=${{ env.GEOIP2_REF }}
+            USE_LTO=${{ env.USE_LTO }}
+            JOBS=${{ env.JOBS }}
+            CERTBOT_VERSION=${{ env.CERTBOT_VERSION }}
+            BUILD_VERSION=${{ env.APP_VERSION }}
+            BUILD_COMMIT=${{ env.BUILD_COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=alpine-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=alpine-${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          digest="${{ steps.build.outputs.digest }}"
+          digest="${digest#sha256:}"
+          if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected image digest: ${{ steps.build.outputs.digest }}"
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          : > "/tmp/digests/${digest}"
+
+      # Named zip artifacts (archive:false renamed downloads and broke imagetools).
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge multi-arch manifest
+    if: github.event_name != 'pull_request'
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Prepare
+        run: |
+          echo "REGISTRY_IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .version
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve app version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            APP_VERSION='${{ inputs.version }}'
+          else
+            APP_VERSION="$(tr -d '[:space:]' < .version)"
+          fi
+          APP_VERSION="${APP_VERSION#v}"
+          if [ -z "$APP_VERSION" ]; then
+            echo '::error::APP_VERSION is empty (set workflow_dispatch version or .version)'
+            exit 1
+          fi
+          echo "APP_VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Annotations on the multi-arch index (metadata-action v6).
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            # develop: alpine-<shortsha>
+            type=sha,prefix=alpine-,format=short,enable=${{ github.ref == 'refs/heads/develop' }}
+            # master / release tags: alpine + alpine-<version>
+            type=raw,value=alpine,enable=${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=alpine-${{ env.APP_VERSION }},enable=${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          tags=()
+          while IFS= read -r t; do
+            tags+=(-t "$t")
+          done < <(jq -cr '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo '::error::No image tags generated for this ref'
+            exit 1
+          fi
+
+          anns=()
+          while IFS= read -r a; do
+            anns+=(--annotation "$a")
+          done < <(jq -cr '.annotations[]?' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+
+          srcs=()
+          for d in *; do
+            # Only accept sha256 digests; ignore any stray downloaded files.
+            [[ "$d" =~ ^[0-9a-f]{64}$ ]] || continue
+            srcs+=("${REGISTRY_IMAGE}@sha256:${d}")
+          done
+          if [ "${#srcs[@]}" -eq 0 ]; then
+            echo '::error::No digest artifacts found in /tmp/digests'
+            ls -la
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tags[@]}" "${anns[@]}" "${srcs[@]}"
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "${REGISTRY_IMAGE}:${{ steps.meta.outputs.version }}"

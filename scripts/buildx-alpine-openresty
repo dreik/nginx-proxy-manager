@@ -1,0 +1,75 @@
+#!/bin/bash
+# Multi-arch build for the Alpine + OpenResty NPM image.
+#
+# Pin OpenResty in docker/alpine/versions.env, or override:
+#   OPENRESTY_VERSION=1.27.1.2 ./scripts/buildx-alpine-openresty --load -t local/nginx-proxy-manager:alpine-openresty
+#
+# Single platform (load into local docker):
+#   ./scripts/buildx-alpine-openresty --load -t local/nginx-proxy-manager:alpine-openresty
+#
+# Multi-arch manifest (push to registry):
+#   PLATFORMS=linux/amd64,linux/arm64 ./scripts/buildx-alpine-openresty --push -t your/repo/nginx-proxy-manager:alpine-openresty
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$DIR/.common.sh"
+
+cd "${DIR}/.." || exit 1
+
+VERSIONS_FILE="${DIR}/../docker/alpine/versions.env"
+if [ ! -f "$VERSIONS_FILE" ]; then
+	echo -e "${RED}> missing ${VERSIONS_FILE}${RESET}" >&2
+	exit 1
+fi
+
+# Env overrides win over versions.env
+_save_OPENRESTY_VERSION="${OPENRESTY_VERSION-__UNSET__}"
+_save_ALPINE_VERSION="${ALPINE_VERSION-__UNSET__}"
+_save_GEOIP2_REF="${GEOIP2_REF-__UNSET__}"
+_save_USE_LTO="${USE_LTO-__UNSET__}"
+_save_JOBS="${JOBS-__UNSET__}"
+_save_CERTBOT_VERSION="${CERTBOT_VERSION-__UNSET__}"
+
+# shellcheck disable=SC1091
+set -a
+. "$VERSIONS_FILE"
+set +a
+
+[ "$_save_OPENRESTY_VERSION" != '__UNSET__' ] && OPENRESTY_VERSION="$_save_OPENRESTY_VERSION"
+[ "$_save_ALPINE_VERSION" != '__UNSET__' ] && ALPINE_VERSION="$_save_ALPINE_VERSION"
+[ "$_save_GEOIP2_REF" != '__UNSET__' ] && GEOIP2_REF="$_save_GEOIP2_REF"
+[ "$_save_USE_LTO" != '__UNSET__' ] && USE_LTO="$_save_USE_LTO"
+[ "$_save_JOBS" != '__UNSET__' ] && JOBS="$_save_JOBS"
+[ "$_save_CERTBOT_VERSION" != '__UNSET__' ] && CERTBOT_VERSION="$_save_CERTBOT_VERSION"
+
+if [ -z "${BUILD_COMMIT:-}" ]; then
+	BUILD_COMMIT=$(git log -n 1 --format=%h 2>/dev/null || echo notset)
+fi
+
+BUILDX_NAME="${BUILDX_NAME:-npm-alpine-openresty}"
+PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
+
+echo -e "${BLUE}> ${CYAN}Building Alpine+OpenResty ${OPENRESTY_VERSION} (${PLATFORMS}, alpine ${ALPINE_VERSION})${RESET}"
+
+docker buildx create --name "$BUILDX_NAME" 2>/dev/null || true
+docker buildx use "$BUILDX_NAME"
+
+docker buildx build \
+	--platform "$PLATFORMS" \
+	--pull \
+	--build-arg ALPINE_VERSION="${ALPINE_VERSION}" \
+	--build-arg OPENRESTY_VERSION="${OPENRESTY_VERSION}" \
+	--build-arg GEOIP2_REF="${GEOIP2_REF}" \
+	--build-arg USE_LTO="${USE_LTO}" \
+	--build-arg JOBS="${JOBS}" \
+	--build-arg CERTBOT_VERSION="${CERTBOT_VERSION:-}" \
+	--build-arg BUILD_VERSION="${BUILD_VERSION:-dev}" \
+	--build-arg BUILD_COMMIT="${BUILD_COMMIT}" \
+	--build-arg BUILD_DATE="$(date '+%Y-%m-%d %T %Z')" \
+	--progress plain \
+	-f docker/Dockerfile.alpine-openresty \
+	"$@" \
+	.
+
+echo -e "${BLUE}> ${GREEN}Alpine+OpenResty ${OPENRESTY_VERSION} buildx complete${RESET}"

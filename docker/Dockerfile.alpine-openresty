@@ -1,0 +1,197 @@
+# syntax=docker/dockerfile:1
+#
+# Alpine + OpenResty build for nginx-proxy-manager.
+#
+# Pin / switch versions in docker/alpine/versions.env (preferred), or:
+#   docker build --build-arg OPENRESTY_VERSION=1.27.1.2 -f docker/Dockerfile.alpine-openresty ...
+#   OPENRESTY_VERSION=1.27.1.2 ./scripts/buildx-alpine-openresty --load -t local/nginx-proxy-manager:alpine-openresty
+#
+# Defaults below mirror docker/alpine/versions.env — keep them in sync when editing either.
+
+ARG ALPINE_VERSION=3.24
+ARG OPENRESTY_VERSION=1.29.2.5
+ARG GEOIP2_REF=445df24ef3781e488cee3dfe8a1e111997fc1dfe
+ARG CERTBOT_VERSION=
+ARG USE_LTO=0
+ARG JOBS=2
+
+############################
+# Stage 1: openresty (builder)
+############################
+FROM alpine:${ALPINE_VERSION} AS openresty
+ARG OPENRESTY_VERSION
+ARG GEOIP2_REF
+ARG USE_LTO
+ARG JOBS
+
+COPY docker/alpine/openresty-build.sh /tmp/openresty-build.sh
+
+RUN chmod +x /tmp/openresty-build.sh \
+	&& OPENRESTY_VERSION="${OPENRESTY_VERSION}" GEOIP2_REF="${GEOIP2_REF}" USE_LTO="${USE_LTO}" JOBS="${JOBS}" /tmp/openresty-build.sh \
+	&& rm -rf /tmp/openresty-build.sh /tmp/openresty* /tmp/ngx_http_geoip2_module /root/.cache
+
+############################
+# Stage 2: frontend (builder)
+############################
+FROM alpine:${ALPINE_VERSION} AS frontend
+
+RUN apk add --no-cache nodejs npm yarn
+
+WORKDIR /app
+COPY frontend/package.json frontend/yarn.lock ./
+RUN yarn install --frozen-lockfile
+
+COPY frontend ./
+ENV NODE_ENV=production
+RUN yarn locale-compile \
+	&& yarn build \
+	&& yarn cache clean \
+	&& find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.json' -o -name '*.svg' \) \
+		! -name '*.br' ! -name '*.gz' -exec gzip -9 -k {} \; 2>/dev/null || true
+
+############################
+# Stage 3: backend (builder)
+############################
+FROM alpine:${ALPINE_VERSION} AS backend
+ENV NODE_ENV=production
+
+RUN apk add --no-cache \
+	nodejs \
+	yarn \
+	python3 \
+	make \
+	g++ \
+	linux-headers
+
+WORKDIR /app
+COPY backend/package.json backend/yarn.lock ./
+RUN yarn install --frozen-lockfile --production \
+	&& yarn cache clean
+
+COPY backend ./
+
+RUN find node_modules -name '*.map' -delete \
+	&& find node_modules -name '*.md' -delete \
+	&& find node_modules -name '*.ts' ! -path '*/types/*' -delete 2>/dev/null || true \
+	&& find node_modules -name '*.node' -type f -exec strip -s {} \; 2>/dev/null || true \
+	&& rm -rf \
+		node_modules/node-gyp \
+		node_modules/node-addon-api \
+	&& find node_modules -type d \( -name test -o -name tests -o -name __tests__ -o -name docs -o -name example -o -name examples \) \
+		-exec rm -rf {} + 2>/dev/null || true
+
+############################
+# Stage 4: certbot (builder)
+############################
+FROM alpine:${ALPINE_VERSION} AS certbot
+ARG CERTBOT_VERSION
+
+COPY docker/alpine/certbot-build.sh /tmp/certbot-build.sh
+
+RUN chmod +x /tmp/certbot-build.sh \
+	&& CERTBOT_VERSION="${CERTBOT_VERSION}" /tmp/certbot-build.sh \
+	&& rm -f /tmp/certbot-build.sh
+
+############################
+# Stage 5: runtime filesystem bundle (rootfs + alpine init, no s6)
+############################
+FROM scratch AS runtime-fs
+
+# Official rootfs without s6 (Alpine uses shell entrypoint instead)
+COPY --exclude=etc/s6-overlay --exclude=etc/nginx/conf.d/dev.conf docker/rootfs /
+
+# Alpine init scripts (replace s6-overlay); common.sh overlays rootfs copy
+COPY --chmod=755 docker/alpine/common.sh /usr/bin/common.sh
+COPY --parents --chmod=755 \
+	docker/alpine/./prepare.sh \
+	docker/alpine/./secrets.sh \
+	docker/alpine/./ipv6.sh \
+	docker/alpine/./start.sh \
+	docker/alpine/./entrypoint.sh \
+	/usr/local/bin/
+COPY --chmod=755 docker/alpine/certbot-runtime.sh /tmp/certbot-runtime.sh
+
+############################
+# Stage 6: runtime
+############################
+FROM alpine:${ALPINE_VERSION}
+
+ARG BUILD_VERSION=dev
+ARG BUILD_COMMIT=notset
+ARG BUILD_DATE=unknown
+ARG OPENRESTY_VERSION
+ARG CERTBOT_VERSION
+
+ENV SUPPRESS_NO_CONFIG_WARNING=1 \
+	NODE_ENV=production \
+	NPM_BUILD_VERSION="${BUILD_VERSION}" \
+	NPM_BUILD_COMMIT="${BUILD_COMMIT}" \
+	NPM_BUILD_DATE="${BUILD_DATE}" \
+	OPENRESTY_VERSION="${OPENRESTY_VERSION}" \
+	PATH="/opt/certbot/bin:${PATH}"
+
+# OpenResty binary + prefix tree (includes LuaJIT/lualib under /etc/nginx)
+COPY --from=openresty --parents \
+	/usr/sbin/nginx \
+	/etc/nginx \
+	/usr/lib/nginx/modules \
+	/
+
+COPY --from=backend /app /app
+COPY --from=frontend /app/dist /app/frontend
+COPY --from=certbot /opt/certbot /opt/certbot
+COPY --from=runtime-fs / /
+
+RUN echo "fs.file-max = 65535" > /etc/sysctl.conf \
+	&& sed -i '1s|#!/bin/bash|#!/bin/sh|; s/\[ "\$OK" == "OK" \]/[ "\$OK" = "OK" ]/' /usr/bin/check-health \
+	&& apk add --no-cache \
+		tini \
+		su-exec \
+		shadow \
+		ca-certificates \
+		curl \
+		tzdata \
+		jq \
+		logrotate \
+		openssl \
+		pcre2 \
+		zlib \
+		libmaxminddb-libs \
+		libgcc \
+		libstdc++ \
+		readline \
+		ncurses-libs \
+		nodejs \
+	&& /tmp/certbot-runtime.sh \
+	&& rm -f /tmp/certbot-runtime.sh \
+	&& find /usr/lib/python3* /opt/certbot -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true \
+	&& find /usr/lib/python3* /opt/certbot -type f -name '*.pyc' -delete 2>/dev/null || true \
+	&& rm -rf \
+		/usr/lib/python3*/ensurepip \
+		/usr/lib/python3*/pydoc_data \
+		/usr/lib/python3*/idlelib \
+		/usr/lib/python3*/tkinter \
+		/usr/lib/python3*/turtle* \
+		/usr/lib/python3*/test \
+		/usr/lib/python3*/turtledemo \
+		/usr/share/man \
+		/usr/share/doc \
+		/root/.cache \
+		/tmp/* \
+		/var/cache/apk/*
+
+EXPOSE 80 81 443
+VOLUME ["/data", "/etc/letsencrypt"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+	CMD /usr/bin/check-health
+
+WORKDIR /app
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+
+LABEL org.label-schema.schema-version="1.0" \
+	org.label-schema.license="MIT" \
+	org.label-schema.name="nginx-proxy-manager-alpine-openresty" \
+	org.label-schema.description="Alpine multi-stage NPM with OpenResty; certbot DNS plugins via venv pip" \
+	org.label-schema.url="https://github.com/NginxProxyManager/nginx-proxy-manager" \
+	org.label-schema.vcs-url="https://github.com/NginxProxyManager/nginx-proxy-manager.git"
